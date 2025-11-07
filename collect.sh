@@ -1,15 +1,16 @@
 #!/bin/bash
-# Comprehensive MySQL Host Diagnostics Script (Full Version - Enhanced OS Detection)
-# Usage: ./mysql_host_diagnostics.sh [host] [port] [user] [password] [database] [sql_file]
-# Supports macOS & Linux (Ubuntu, RHEL, Red Hat, CentOS, Rocky, AlmaLinux, etc.) | GB/GMT
+# Comprehensive MySQL Host Diagnostics Script (Split Logs: host.log + mysql.log)
+# Usage: ./mysql_host_diagnostics.sh [host] [port] [user] [password] [database] [sql_dir]
+# Outputs: host_diagnostics.log + mysql_diagnostics.log
 
 # Configuration defaults
 DEFAULT_HOST="localhost"
 DEFAULT_PORT="3306"
 DEFAULT_USER="root"
 DEFAULT_DB="mysql"
-DEFAULT_SQL_FILE="mysql_diagnostics_complete.sql"
-OUTPUT_FILE="${OUTPUT_FILE:-mysql_host_diagnostics.txt}"
+DEFAULT_SQL_DIR="./mysql_diagnostics"
+HOST_LOG="${HOST_LOG:-host_diagnostics.log}"
+MYSQL_LOG="${MYSQL_LOG:-mysql_diagnostics.log}"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')
 
 # Detect OS
@@ -18,22 +19,15 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     OS_FAMILY="macOS"
 else
     OS="Linux"
-    # Detailed Linux distribution detection
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         OS_ID="${ID:-unknown}"
         OS_VERSION_ID="${VERSION_ID:-unknown}"
         OS_PRETTY_NAME="${PRETTY_NAME:-unknown}"
         case "$OS_ID" in
-            ubuntu|debian)
-                OS_FAMILY="Debian"
-                ;;
-            rhel|centos|rocky|almalinux|fedora|ol)
-                OS_FAMILY="RedHat"
-                ;;
-            *)
-                OS_FAMILY="OtherLinux"
-                ;;
+            ubuntu|debian) OS_FAMILY="Debian" ;;
+            rhel|centos|rocky|almalinux|fedora|ol) OS_FAMILY="RedHat" ;;
+            *) OS_FAMILY="OtherLinux" ;;
         esac
     else
         OS_ID="unknown"
@@ -49,203 +43,179 @@ MYSQL_PORT="${2:-$DEFAULT_PORT}"
 MYSQL_USER="${3:-$DEFAULT_USER}"
 MYSQL_PASSWORD="${4:-}"
 MYSQL_DB="${5:-$DEFAULT_DB}"
-SQL_FILE="${6:-$DEFAULT_SQL_FILE}"
+SQL_DIR="${6:-$DEFAULT_SQL_DIR}"
 
-# If password is empty, prompt securely
+# Prompt for password if not provided
 if [[ -z "$MYSQL_PASSWORD" ]]; then
     read -s -p "Enter MySQL password for '$MYSQL_USER'@'$MYSQL_HOST:$MYSQL_PORT' (DB: $MYSQL_DB): " MYSQL_PASSWORD
     echo
 fi
 
-# Function: Test MySQL connection and database access
+# Test connection
 test_mysql_connection() {
-    echo "Testing MySQL connection and database access..."
-    local test_query="SELECT 1 AS connection_test;"
     local result=$(mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
-                         --database="$MYSQL_DB" -Nse "$test_query" 2>/dev/null)
-    if [[ "$result" == "1" ]]; then
-        echo "Connection and database access: SUCCESS"
-        return 0
-    else
-        echo "Connection and database access: FAILED"
-        echo "  - Verify host, port, user, password, and database '$MYSQL_DB' exists."
-        echo "  - Ensure user has SELECT privilege on '$MYSQL_DB'."
-        return 1
-    fi
+                         --database="$MYSQL_DB" -Nse "SELECT 1" 2>/dev/null)
+    [[ "$result" == "1" ]]
 }
 
-# Function: Validate SQL file and prepare with USE
-prepare_sql_file() {
-    if [[ ! -f "$SQL_FILE" ]]; then
-        echo "ERROR: SQL file '$SQL_FILE' not found in current directory."
-        return 1
-    fi
-
-    if [[ ! -r "$SQL_FILE" ]]; then
-        echo "ERROR: SQL file '$SQL_FILE' is not readable."
-        return 1
-    fi
-
-    # Ensure USE statement is at the top
-    if ! head -10 "$SQL_FILE" | grep -qi "^USE[[:space:]]*[\`\"']*$MYSQL_DB[\`\"'];"; then
-        echo "Injecting 'USE \`$MYSQL_DB\`; at top of SQL file..."
-        {
-            echo "USE \`$MYSQL_DB\`;";
-            cat "$SQL_FILE"
-        } > "${SQL_FILE}.tmp" && mv "${SQL_FILE}.tmp" "$SQL_FILE"
-    fi
-    return 0
-}
-
-# Function to execute MySQL SQL script
+# Execute SQL files into MYSQL_LOG
 execute_mysql_diagnostics() {
-    echo "Executing MySQL diagnostics from '$SQL_FILE' using database '$MYSQL_DB'..."
+    local sql_dir="${1:-$DEFAULT_SQL_DIR}"
+    echo "Executing diagnostics from: $sql_dir" | tee -a "$HOST_LOG"
 
-    # Validate SQL file
-    if ! prepare_sql_file; then
-        echo "SQL file preparation failed. Aborting." | tee -a "$OUTPUT_FILE"
-        return 1
-    fi
+    [[ -d "$sql_dir" ]] || { echo "ERROR: Directory '$sql_dir' not found." | tee -a "$HOST_LOG"; return 1; }
 
-    # Test connection
     if ! test_mysql_connection; then
-        echo "MySQL connection test failed. Aborting." | tee -a "$OUTPUT_FILE"
+        echo "MySQL connection failed. Aborting." | tee -a "$HOST_LOG"
         return 1
     fi
 
-    # Execute with error capture
-    local temp_out="${OUTPUT_FILE}.mysql"
-    mysql -t -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
-          --database="$MYSQL_DB" --skip-column-names --batch < "$SQL_FILE" > "$temp_out" 2>&1
+    # Initialize MySQL log
+    > "$MYSQL_LOG"
+    echo "MySQL Diagnostics Report" >> "$MYSQL_LOG"
+    echo "Generated: $TIMESTAMP" >> "$MYSQL_LOG"
+    echo "Server: $MYSQL_HOST:$MYSQL_PORT" >> "$MYSQL_LOG"
+    echo "User: $MYSQL_USER" >> "$MYSQL_LOG"
+    echo "Database: $MYSQL_DB" >> "$MYSQL_LOG"
+    echo "SQL Directory: $sql_dir" >> "$MYSQL_LOG"
+    echo "----------------------------------------" >> "$MYSQL_LOG"
 
-    if [[ $? -eq 0 ]]; then
-        cat "$temp_out" >> "$OUTPUT_FILE"
-        echo "MySQL diagnostics completed successfully." | tee -a "$OUTPUT_FILE"
+    # Run helpers.sql FIRST
+    local helper_file="$sql_dir/helpers.sql"
+    if [[ -f "$helper_file" ]]; then
+        echo "Running helpers.sql (required)..." | tee -a "$HOST_LOG"
+        mysql -t -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+              --database="$MYSQL_DB" --skip-column-names --batch < "$helper_file" >> "$MYSQL_LOG" 2>&1 || \
+            echo "Warning: helpers.sql had issues." >> "$HOST_LOG"
     else
-        echo "MySQL diagnostics had warnings/errors (non-fatal):" | tee -a "$OUTPUT_FILE"
-        grep -i "SKIPPED\|Warning\|Error" "$temp_out" | tail -20 >> "$OUTPUT_FILE" || true
+        echo "ERROR: helpers.sql not found in $sql_dir" | tee -a "$HOST_LOG"
+        return 1
     fi
-    rm -f "$temp_out"
+
+    # Run all other SQL files
+    for sql_file in "$sql_dir"/[0-9][0-9]_*.sql; do
+        [[ -f "$sql_file" ]] || continue
+        echo "Running $(basename "$sql_file")..." | tee -a "$HOST_LOG"
+        mysql -t -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+              --database="$MYSQL_DB" --skip-column-names --batch < "$sql_file" >> "$MYSQL_LOG" 2>&1 || \
+            echo "Warning: $(basename "$sql_file") had issues." >> "$HOST_LOG"
+    done
+
+    echo "MySQL diagnostics completed. Output: $MYSQL_LOG" | tee -a "$HOST_LOG"
 }
 
-# Function to collect OS version (enhanced for RedHat/Ubuntu variants)
+# Collect OS info
 collect_os_info() {
-    echo "--- Operating System Information ---" >> "$OUTPUT_FILE"
+    echo "--- Operating System Information ---" >> "$HOST_LOG"
     if [[ "$OS" == "macOS" ]]; then
-        echo "OS: macOS $(sw_vers -productName) $(sw_vers -productVersion)" >> "$OUTPUT_FILE"
-        echo "Build: $(sw_vers -buildVersion)" >> "$OUTPUT_FILE"
-        echo "Kernel: $(uname -r)" >> "$OUTPUT_FILE"
+        echo "OS: macOS $(sw_vers -productName) $(sw_vers -productVersion)" >> "$HOST_LOG"
+        echo "Build: $(sw_vers -buildVersion)" >> "$HOST_LOG"
+        echo "Kernel: $(uname -r)" >> "$HOST_LOG"
     else
         if [[ -f /etc/os-release ]]; then
             . /etc/os-release
-            echo "Distribution ID: $ID" >> "$OUTPUT_FILE"
-            echo "Version ID: $VERSION_ID" >> "$OUTPUT_FILE"
-            echo "Pretty Name: $PRETTY_NAME" >> "$OUTPUT_FILE"
-            echo "Family: $OS_FAMILY" >> "$OUTPUT_FILE"
-            echo "Kernel: $(uname -r)" >> "$OUTPUT_FILE"
+            echo "Distribution ID: $ID" >> "$HOST_LOG"
+            echo "Version ID: $VERSION_ID" >> "$HOST_LOG"
+            echo "Pretty Name: $PRETTY_NAME" >> "$HOST_LOG"
+            echo "Family: $OS_FAMILY" >> "$HOST_LOG"
+            echo "Kernel: $(uname -r)" >> "$HOST_LOG"
         else
-            echo "OS detection failed (no /etc/os-release)." >> "$OUTPUT_FILE"
-            echo "Kernel: $(uname -r)" >> "$OUTPUT_FILE"
+            echo "OS detection failed." >> "$HOST_LOG"
+            echo "Kernel: $(uname -r)" >> "$HOST_LOG"
         fi
     fi
-    echo "" >> "$OUTPUT_FILE"
+    echo "" >> "$HOST_LOG"
 }
 
-# Function to collect detailed CPU information
+# Collect CPU
 collect_cpu_info() {
-    echo "--- CPU Information (Detailed List) ---" >> "$OUTPUT_FILE"
+    echo "--- CPU Information (Detailed List) ---" >> "$HOST_LOG"
     if [[ "$OS" == "macOS" ]]; then
-        sysctl -n machdep.cpu.brand_string >> "$OUTPUT_FILE"
-        echo "Cores: $(sysctl -n hw.physicalcpu)" >> "$OUTPUT_FILE"
-        echo "Threads: $(sysctl -n hw.logicalcpu)" >> "$OUTPUT_FILE"
-        echo "Frequency: $(sysctl -n hw.cpufrequency / 1000000 | awk '{print $1 " MHz"}')" >> "$OUTPUT_FILE"
+        sysctl -n machdep.cpu.brand_string >> "$HOST_LOG"
+        echo "Cores: $(sysctl -n hw.physicalcpu)" >> "$HOST_LOG"
+        echo "Threads: $(sysctl -n hw.logicalcpu)" >> "$HOST_LOG"
     else
-        if command -v lscpu >/dev/null 2>&1; then
-            lscpu >> "$OUTPUT_FILE"
-        else
-            echo "CPU cores: $(nproc)" >> "$OUTPUT_FILE"
-            cat /proc/cpuinfo | grep -E 'processor|model name|cpu MHz|cache size|flags' >> "$OUTPUT_FILE"
-        fi
+        command -v lscpu >/dev/null && lscpu >> "$HOST_LOG" || \
+            { echo "CPU cores: $(nproc)"; cat /proc/cpuinfo | grep -E 'processor|model name|cpu MHz|cache size|flags'; } >> "$HOST_LOG"
     fi
     if [[ "$OS" == "macOS" ]]; then
-        echo "Load Average: $(sysctl -n vm.loadavg | sed 's/[{}]//g')" >> "$OUTPUT_FILE"
+        echo "Load Average: $(sysctl -n vm.loadavg | sed 's/[{}]//g')" >> "$HOST_LOG"
     else
-        echo "Load Average (1/5/15 min): $(uptime | awk -F'load average:' '{print $2}')" >> "$OUTPUT_FILE"
+        echo "Load Average: $(uptime | awk -F'load average:' '{print $2}')" >> "$HOST_LOG"
     fi
-    echo "" >> "$OUTPUT_FILE"
+    echo "" >> "$HOST_LOG"
 }
 
-# Function to collect memory usage
+# Collect memory
 collect_memory_info() {
-    echo "--- Memory Usage ---" >> "$OUTPUT_FILE"
+    echo "--- Memory Usage ---" >> "$HOST_LOG"
     if [[ "$OS" == "macOS" ]]; then
-        vm_stat | head -10 >> "$OUTPUT_FILE"
-        echo "Total RAM: $(sysctl -n hw.memsize | awk '{print $1/1024/1024/1024 " GB"}')" >> "$OUTPUT_FILE"
+        vm_stat | head -10 >> "$HOST_LOG"
+        echo "Total RAM: $(sysctl -n hw.memsize | awk '{printf \"%.2f GB\", $1/1024/1024/1024}')" >> "$HOST_LOG"
     else
-        if command -v free >/dev/null 2>&1; then
-            free -h >> "$OUTPUT_FILE"
-        else
-            echo "Memory detection failed." >> "$OUTPUT_FILE"
-        fi
+        command -v free >/dev/null && free -h >> "$HOST_LOG" || echo "Memory detection failed." >> "$HOST_LOG"
     fi
-    echo "" >> "$OUTPUT_FILE"
+    echo "" >> "$HOST_LOG"
 }
 
-# Function to collect storage usage
+# Collect storage
 collect_storage_info() {
-    echo "--- Storage Allocation and Usage ---" >> "$OUTPUT_FILE"
+    echo "--- Storage Allocation and Usage ---" >> "$HOST_LOG"
     if [[ "$OS" == "macOS" ]]; then
-        df -h | grep -E '^Filesystem|/Volumes' >> "$OUTPUT_FILE"
+        df -h | grep -E '^Filesystem|/Volumes' >> "$HOST_LOG"
     else
-        df -hT | grep -E '^Filesystem|/' >> "$OUTPUT_FILE"
+        df -hT | grep -E '^Filesystem|/' >> "$HOST_LOG"
     fi
-    echo "" >> "$OUTPUT_FILE"
+    echo "" >> "$HOST_LOG"
 }
 
-# Function to collect MySQL/MariaDB process list
+# Collect MySQL processes
 collect_mysql_processes() {
-    echo "--- MySQL/MariaDB Process Information ---" >> "$OUTPUT_FILE"
-    local mysql_pids=$(pgrep -f 'mysqld|mariadbd|mysql' 2>/dev/null || echo "")
-    if [[ -n "$mysql_pids" ]]; then
+    echo "--- MySQL/MariaDB Process Information ---" >> "$HOST_LOG"
+    local pids=$(pgrep -f 'mysqld|mariadbd|mysql' 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        local pid_list=$(echo "$pids" | tr '\n' ',' | sed 's/,$//')
         if [[ "$OS" == "macOS" ]]; then
-            ps -p $(echo $mysql_pids | tr ' ' ',') -o pid,ppid,user,pcpu,pmem,etime,command | sort -k4 -nr >> "$OUTPUT_FILE"
+            ps -p "$pid_list" -o pid,ppid,user,pcpu,pmem,etime,command | sort -k4 -nr >> "$HOST_LOG"
         else
-            ps -p $(echo "$mysql_pids" | tr ' ' ',') -o pid,ppid,user,%cpu,%mem,etime,cmd --sort=-%cpu >> "$OUTPUT_FILE"
+            ps -p "$pid_list" -o pid,ppid,user,%cpu,%mem,etime,cmd --sort=-%cpu >> "$HOST_LOG"
         fi
     else
-        echo "No MySQL/MariaDB processes detected." >> "$OUTPUT_FILE"
+        echo "No MySQL/MariaDB processes detected." >> "$HOST_LOG"
     fi
-    echo "" >> "$OUTPUT_FILE"
+    echo "" >> "$HOST_LOG"
 }
 
-# Function to collect MySQL host and port from server
+# Collect MySQL host/port
 collect_mysql_host_port() {
-    echo "--- MySQL Server Host and Port (Runtime) ---" >> "$OUTPUT_FILE"
-    mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
-          --database="$MYSQL_DB" -Nse "SELECT @@hostname AS Host, @@port AS Port;" 2>/dev/null >> "$OUTPUT_FILE" || \
-        echo "Host: Unable to retrieve | Port: Unable to retrieve (check credentials)" >> "$OUTPUT_FILE"
-    echo "" >> "$OUTPUT_FILE"
+    echo "--- MySQL Server Host and Port (Runtime) ---" >> "$HOST_LOG"
+    mysql -t -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+          --database="$MYSQL_DB" -Nse "SELECT @@hostname, @@port;" 2>/dev/null >> "$HOST_LOG" || \
+        echo "Unable to retrieve" >> "$HOST_LOG"
+    echo "" >> "$HOST_LOG"
 }
 
-# Main execution
+# Main
 main() {
-    # Initialize output file
-    > "$OUTPUT_FILE"
-    echo "MySQL Host Diagnostics Report ($OS)" >> "$OUTPUT_FILE"
-    echo "Generated: $TIMESTAMP" >> "$OUTPUT_FILE"
-    echo "Host: $(hostname)" >> "$OUTPUT_FILE"
-    echo "Country: GB" >> "$OUTPUT_FILE"
-    echo "Time Zone: GMT" >> "$OUTPUT_FILE"
-    echo "" >> "$OUTPUT_FILE"
+    # Initialize logs
+    > "$HOST_LOG"
+    > "$MYSQL_LOG"
 
-    # Log connection details
-    echo "Connection Target: $MYSQL_HOST:$MYSQL_PORT" >> "$OUTPUT_FILE"
-    echo "User: $MYSQL_USER" >> "$OUTPUT_FILE"
-    echo "Default Database: $MYSQL_DB" >> "$OUTPUT_FILE"
-    echo "SQL File: $SQL_FILE" >> "$OUTPUT_FILE"
-    echo "" >> "$OUTPUT_FILE"
+    echo "MySQL Host Diagnostics Report ($OS)" >> "$HOST_LOG"
+    echo "Generated: $TIMESTAMP" >> "$HOST_LOG"
+    echo "Host: $(hostname)" >> "$HOST_LOG"
+    echo "Country: GB" >> "$HOST_LOG"
+    echo "Time Zone: GMT" >> "$HOST_LOG"
+    echo "" >> "$HOST_LOG"
 
-    # Collect host statistics
+    echo "Connection Target: $MYSQL_HOST:$MYSQL_PORT" >> "$HOST_LOG"
+    echo "User: $MYSQL_USER" >> "$HOST_LOG"
+    echo "Default Database: $MYSQL_DB" >> "$HOST_LOG"
+    echo "SQL Directory: $SQL_DIR" >> "$HOST_LOG"
+    echo "Host Log: $HOST_LOG" >> "$HOST_LOG"
+    echo "MySQL Log: $MYSQL_LOG" >> "$HOST_LOG"
+    echo "" >> "$HOST_LOG"
+
     collect_os_info
     collect_cpu_info
     collect_memory_info
@@ -253,21 +223,25 @@ main() {
     collect_mysql_processes
     collect_mysql_host_port
 
-    # Execute diagnostics
-    execute_mysql_diagnostics
+    execute_mysql_diagnostics "$SQL_DIR"
 
-    echo "Diagnostics complete. Output saved to $OUTPUT_FILE"
+    echo "Diagnostics complete."
+    echo "  Host Log: $HOST_LOG"
+    echo "  MySQL Log: $MYSQL_LOG"
 }
 
-# Show help
-if [[ "$1" == "-h" || "$1" == "-help" || "$1" == "--help" ]]; then
-    echo "Usage: $0 [host] [port] [user] [password] [database] [sql_file]"
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Usage: $0 [host] [port] [user] [password] [database] [sql_dir]"
     echo "  host     - MySQL host (default: $DEFAULT_HOST)"
     echo "  port     - MySQL port (default: $DEFAULT_PORT)"
     echo "  user     - MySQL user (default: $DEFAULT_USER)"
     echo "  password - MySQL password (prompt if empty)"
     echo "  database - Default database (default: $DEFAULT_DB)"
-    echo "  sql_file - Path to SQL diagnostic script (default: $DEFAULT_SQL_FILE)"
+    echo "  sql_dir  - Directory with SQL files (default: $DEFAULT_SQL_DIR)"
+    echo ""
+    echo "Outputs:"
+    echo "  $HOST_LOG  - Host-level diagnostics (OS, CPU, memory, processes)"
+    echo "  $MYSQL_LOG - MySQL diagnostics (queries, replication, etc.)"
     exit 0
 fi
 
