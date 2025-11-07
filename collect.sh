@@ -115,7 +115,7 @@ execute_mysql_diagnostics() {
 
     # Execute with error capture
     local temp_out="${OUTPUT_FILE}.mysql"
-    mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
+    mysql -t -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
           --database="$MYSQL_DB" --skip-column-names --batch < "$SQL_FILE" > "$temp_out" 2>&1
 
     if [[ $? -eq 0 ]]; then
